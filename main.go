@@ -1,3 +1,5 @@
+// AF_Packet support for gotm
+
 package main
 
 import (
@@ -22,7 +24,8 @@ import (
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
-	"github.com/google/gopacket/pcap"
+	//"github.com/google/gopacket/pcap"
+	"github.com/google/gopacket/afpacket"
 	"github.com/google/gopacket/pcapgo"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -228,11 +231,14 @@ func doSniff(intf string, worker int, writerchan chan PcapFrame, flowfilterchan 
 	workerString := fmt.Sprintf("%d", worker)
 
 	var err error
-	handle, err := pcap.OpenLive(intf, MAX_ETHERNET_MTU, true, pcap.BlockForever)
+	//handle, err := pcap.OpenLive(intf, MAX_ETHERNET_MTU, true, pcap.BlockForever)
+	handle, err := afpacket.NewTPacket(afpacket.OptInterface(intf))
+	
 	if err != nil {
 		panic(err)
 	}
-	err = handle.SetBPFFilter(filter)
+	//err = handle.SetBPFFilter(filter)
+	err = handle.SetBPF(filter)
 	if err != nil { // optional
 		panic(err)
 	}
@@ -314,7 +320,12 @@ func doSniff(intf string, worker int, writerchan chan PcapFrame, flowfilterchan 
 		speedup++
 		if speedup == 5000 {
 			speedup = 0
-			pcapStats, err = handle.Stats()
+			//pcapStats, err = handle.Stats()
+			socketStats, socketStatsV3, err = handle.SocketStats()
+			tp_packets := socketStats.tp_packets + socketStatsV3.tp_packets
+			tp_drops := socketStats.tp_drops + socketStatsV3.tp_drops
+			tp_freeze_q_cnt := socketStatsV3.tp_freeze_q_cnt
+			
 			if err != nil {
 				log.Fatal(err)
 			}
@@ -329,10 +340,10 @@ func doSniff(intf string, worker int, writerchan chan PcapFrame, flowfilterchan 
 						delete(seen, flow)
 					}
 				}
-				log.Printf("if=%s W=%02d flows=%d removed=%d bytes=%d pkts=%d output=%d outpct=%.1f recvd=%d dropped=%d ifdropped=%d",
+				log.Printf("if=%s W=%02d flows=%d removed=%d bytes=%d pkts=%d output=%d outpct=%.1f tp_packets=%d tp_drops=%d tp_freeze_q_cnt=%d",
 					intf, worker, len(seen), removedFlows,
 					totalBytes, totalPackets, outputPackets, 100*float64(outputPackets)/float64(totalPackets),
-					pcapStats.PacketsReceived, pcapStats.PacketsDropped, pcapStats.PacketsIfDropped)
+					tp_packets, tp_drops, tp_freeze_q_cnt)
 
 				expireSeconds := float64(time.Since(lastcleanup).Seconds())
 				mExpired.WithLabelValues(intf, workerString).Set(float64(removedFlows))
@@ -355,9 +366,9 @@ func doSniff(intf string, worker int, writerchan chan PcapFrame, flowfilterchan 
 			mOutput.WithLabelValues(intf, workerString).Add(float64(outputPackets))
 			outputPackets = 0
 
-			mReceived.WithLabelValues(intf, workerString).Set(float64(pcapStats.PacketsReceived))
-			mDropped.WithLabelValues(intf, workerString).Set(float64(pcapStats.PacketsDropped))
-			mIfDropped.WithLabelValues(intf, workerString).Set(float64(pcapStats.PacketsIfDropped))
+			mReceived.WithLabelValues(intf, workerString).Set(float64(tp_packets))
+			mDropped.WithLabelValues(intf, workerString).Set(float64(tp_drops)
+			mIfDropped.WithLabelValues(intf, workerString).Set(float64(tp_freeze_q_cnt)
 		}
 	}
 }
@@ -532,7 +543,7 @@ func main() {
 	}
 
 	currentFileName := fmt.Sprintf("%s_current.pcap.tmp", iface)
-	workerCountString := os.Getenv("SNF_NUM_RINGS")
+	workerCountString := os.Getenv("NUM_RINGS")
 	workerCount := mustAtoiWithDefault(workerCountString, 1)
 
 	pcapWriterChan := make(chan PcapFrame, 500000)
