@@ -367,8 +367,8 @@ func doSniff(intf string, worker int, writerchan chan PcapFrame, flowfilterchan 
 			outputPackets = 0
 
 			mReceived.WithLabelValues(intf, workerString).Set(float64(tp_packets))
-			mDropped.WithLabelValues(intf, workerString).Set(float64(tp_drops)
-			mIfDropped.WithLabelValues(intf, workerString).Set(float64(tp_freeze_q_cnt)
+			mDropped.WithLabelValues(intf, workerString).Set(float64(tp_drops))
+			mIfDropped.WithLabelValues(intf, workerString).Set(float64(tp_freeze_q_cnt))
 		}
 	}
 }
