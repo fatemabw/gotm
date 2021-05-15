@@ -56,6 +56,8 @@ var (
 	dumnoEndpoint          string
 	largeFlowSizeMegabytes uint
 	dumbnoEnabled          bool
+	
+	fanoutGroup    int
 )
 
 //Metrics
@@ -165,7 +167,9 @@ func init() {
 
 	flag.UintVar(&largeFlowSizeMegabytes, "largeflowsize", 1024, "Large flow size in megabytes")
 	flag.StringVar(&dumnoEndpoint, "dumbno", "", "Endpoint that dumbno is listening on, i.e. 127.0.0.1:9000")
-
+	
+	flag.IntVar(&fanoutGroup, "fanoutGroup", 42, "fanout group id")
+	
 	prometheus.MustRegister(mActiveFlows)
 	prometheus.MustRegister(mExpired)
 	prometheus.MustRegister(mExpiredDurTotal)
@@ -312,6 +316,15 @@ func afpacketComputeSize(targetSizeMb int, snaplen int, pageSize int) (
 	return frameSize, blockSize, numBlocks, nil
 }
 
+func (h *afpacketHandle) SetFanout(t afpacket.FanoutType, id uint16) error {
+	return h.TPacket.SetFanout(t, id)
+}
+
+// Close will close afpacket source.
+func (h *afpacketHandle) Close() {
+	h.TPacket.Close()
+}
+
 func doSniff(intf string, worker int, writerchan chan PcapFrame, flowfilterchan chan FilterRequest) {
 	runtime.LockOSThread()
 	log.Printf("Starting worker %d on interface %s", worker, intf)
@@ -338,12 +351,16 @@ func doSniff(intf string, worker int, writerchan chan PcapFrame, flowfilterchan 
 	if err != nil { // optional
 		panic(err)
 	}
-
+	
+	err = afpacketHandle.SetFanout(afpacket.FanoutHashWithDefrag, uint16(fanoutGroup))
+	if err != nil {
+		panic(err)
+	}
+	defer afpacketHandle.Close()
+	
 	seen := make(map[FiveTuple]*trackedFlow)
 	var totalFlows, totalBytes, outputBytes, totalPackets, outputPackets uint
-	//var ss afpacket.SocketStats
-	//var ss3 afpacket.SocketStatsV3
-	//var tp_packets, tp_drops, tp_freeze_q_cnt uint
+
 	lastcleanup := time.Now()
 
 	var eth layers.Ethernet
