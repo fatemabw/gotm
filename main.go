@@ -24,8 +24,9 @@ import (
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
-	//"github.com/google/gopacket/pcap"
+	"github.com/google/gopacket/pcap"
 	"github.com/google/gopacket/afpacket"
+	"golang.org/x/net/bpf"
 	"github.com/google/gopacket/pcapgo"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -225,27 +226,124 @@ func mustAtoiWithDefault(s string, defaultValue int) int {
 	return i
 }
 
+type afpacketHandle struct {
+	TPacket *afpacket.TPacket
+}
+
+// SetBPFFilter translates a BPF filter string into BPF RawInstruction and applies them.
+func (h *afpacketHandle) SetBPFFilter(filter string, snaplen int) (err error) {
+	pcapBPF, err := pcap.CompileBPFFilter(layers.LinkTypeEthernet, snaplen, filter)
+	if err != nil {
+		return err
+	}
+	bpfIns := []bpf.RawInstruction{}
+	for _, ins := range pcapBPF {
+		bpfIns2 := bpf.RawInstruction{
+			Op: ins.Code,
+			Jt: ins.Jt,
+			Jf: ins.Jf,
+			K:  ins.K,
+		}
+		bpfIns = append(bpfIns, bpfIns2)
+	}
+	if h.TPacket.SetBPF(bpfIns); err != nil {
+		return err
+	}
+	return h.TPacket.SetBPF(bpfIns)
+}
+
+func newAfpacketHandle(device string, snaplen int, block_size int, num_blocks int, timeout time.Duration) (*afpacketHandle, error) {
+
+	h := &afpacketHandle{}
+	var err error
+
+	if device == "any" {
+		h.TPacket, err = afpacket.NewTPacket(
+			afpacket.OptFrameSize(snaplen),
+			afpacket.OptBlockSize(block_size),
+			afpacket.OptNumBlocks(num_blocks),
+			afpacket.OptPollTimeout(timeout),
+			afpacket.SocketRaw,
+			afpacket.TPacketVersion3)
+	} else {
+		h.TPacket, err = afpacket.NewTPacket(
+			afpacket.OptInterface(device),
+			afpacket.OptFrameSize(snaplen),
+			afpacket.OptBlockSize(block_size),
+			afpacket.OptNumBlocks(num_blocks),
+			afpacket.OptPollTimeout(timeout),
+			afpacket.SocketRaw,
+			afpacket.TPacketVersion3)
+	}
+	return h, err
+}
+
+// ZeroCopyReadPacketData satisfies ZeroCopyPacketDataSource interface
+func (h *afpacketHandle) ZeroCopyReadPacketData() (data []byte, ci gopacket.CaptureInfo, err error) {
+	return h.TPacket.ZeroCopyReadPacketData()
+}
+
+// SocketStats prints received, dropped, queue-freeze packet stats.
+func (h *afpacketHandle) SocketStats() (as afpacket.SocketStats, asv afpacket.SocketStatsV3, err error) {
+	return h.TPacket.SocketStats()
+}
+
+// afpacketComputeSize computes the block_size and the num_blocks in such a way that the
+// allocated mmap buffer is close to but smaller than target_size_mb.
+// The restriction is that the block_size must be divisible by both the
+// frame size and page size.
+func afpacketComputeSize(targetSizeMb int, snaplen int, pageSize int) (
+	frameSize int, blockSize int, numBlocks int, err error) {
+
+	if snaplen < pageSize {
+		frameSize = pageSize / (pageSize / snaplen)
+	} else {
+		frameSize = (snaplen/pageSize + 1) * pageSize
+	}
+
+	// 128 is the default from the gopacket library so just use that
+	blockSize = frameSize * 128
+	numBlocks = (targetSizeMb) / blockSize
+
+	if numBlocks == 0 {
+		return 0, 0, 0, fmt.Errorf("Interface buffersize is too small")
+	}
+
+	return frameSize, blockSize, numBlocks, nil
+}
+
 func doSniff(intf string, worker int, writerchan chan PcapFrame, flowfilterchan chan FilterRequest) {
 	runtime.LockOSThread()
 	log.Printf("Starting worker %d on interface %s", worker, intf)
 	workerString := fmt.Sprintf("%d", worker)
 
 	var err error
+
 	//handle, err := pcap.OpenLive(intf, MAX_ETHERNET_MTU, true, pcap.BlockForever)
-	handle, err := afpacket.NewTPacket(afpacket.OptInterface(intf))
-	
+	//handle, err := afpacket.NewTPacket(
+	//			afpacket.OptInterface(intf), 
+	//			afpacket.OptFrameSize(MAX_ETHERNET_MTU), 
+	//			afpacket.OptPollTimeout(pcap.BlockForever))
+
+	szFrame, szBlock, numBlocks, err := afpacketComputeSize(OUTPUT_BUFFER_SIZE, MAX_ETHERNET_MTU, os.Getpagesize())
+	if err != nil {
+		panic(err)
+	}
+	afpacketHandle, err := newAfpacketHandle(intf, szFrame, szBlock, numBlocks, pcap.BlockForever)
 	if err != nil {
 		panic(err)
 	}
 	//err = handle.SetBPFFilter(filter)
-	err = handle.SetBPF(filter)
+	err = afpacketHandle.SetBPFFilter(filter, MAX_ETHERNET_MTU)
 	if err != nil { // optional
 		panic(err)
 	}
 
 	seen := make(map[FiveTuple]*trackedFlow)
 	var totalFlows, totalBytes, outputBytes, totalPackets, outputPackets uint
-	var pcapStats *pcap.Stats
+	//var ss afpacket.SocketStats
+	//var ss3 afpacket.SocketStatsV3
+	//var tp_packets, tp_drops, tp_freeze_q_cnt uint
 	lastcleanup := time.Now()
 
 	var eth layers.Ethernet
@@ -260,7 +358,7 @@ func doSniff(intf string, worker int, writerchan chan PcapFrame, flowfilterchan 
 	var speedup int
 	defaultLogThreshold := 1024 * 1024 * largeFlowSizeMegabytes
 	for {
-		packetData, ci, err := handle.ZeroCopyReadPacketData()
+		packetData, ci, err := afpacketHandle.ZeroCopyReadPacketData()
 		if err == io.EOF {
 			break
 		} else if err != nil {
@@ -321,10 +419,7 @@ func doSniff(intf string, worker int, writerchan chan PcapFrame, flowfilterchan 
 		if speedup == 5000 {
 			speedup = 0
 			//pcapStats, err = handle.Stats()
-			socketStats, socketStatsV3, err = handle.SocketStats()
-			tp_packets := socketStats.tp_packets + socketStatsV3.tp_packets
-			tp_drops := socketStats.tp_drops + socketStatsV3.tp_drops
-			tp_freeze_q_cnt := socketStatsV3.tp_freeze_q_cnt
+			ss, ss3, err := afpacketHandle.SocketStats()
 			
 			if err != nil {
 				log.Fatal(err)
@@ -340,10 +435,10 @@ func doSniff(intf string, worker int, writerchan chan PcapFrame, flowfilterchan 
 						delete(seen, flow)
 					}
 				}
-				log.Printf("if=%s W=%02d flows=%d removed=%d bytes=%d pkts=%d output=%d outpct=%.1f tp_packets=%d tp_drops=%d tp_freeze_q_cnt=%d",
+				log.Printf("if=%s W=%02d flows=%d removed=%d bytes=%d pkts=%d output=%d outpct=%.1f stats{rec, dropped}: %d Statsv3{rec, dropped, queue-freeze}: %d",
 					intf, worker, len(seen), removedFlows,
 					totalBytes, totalPackets, outputPackets, 100*float64(outputPackets)/float64(totalPackets),
-					tp_packets, tp_drops, tp_freeze_q_cnt)
+					ss, ss3)
 
 				expireSeconds := float64(time.Since(lastcleanup).Seconds())
 				mExpired.WithLabelValues(intf, workerString).Set(float64(removedFlows))
@@ -366,9 +461,9 @@ func doSniff(intf string, worker int, writerchan chan PcapFrame, flowfilterchan 
 			mOutput.WithLabelValues(intf, workerString).Add(float64(outputPackets))
 			outputPackets = 0
 
-			mReceived.WithLabelValues(intf, workerString).Set(float64(tp_packets))
-			mDropped.WithLabelValues(intf, workerString).Set(float64(tp_drops))
-			mIfDropped.WithLabelValues(intf, workerString).Set(float64(tp_freeze_q_cnt))
+			//mReceived.WithLabelValues(intf, workerString).Set(float64(tp_packets))
+			//mDropped.WithLabelValues(intf, workerString).Set(float64(tp_drops))
+			//mIfDropped.WithLabelValues(intf, workerString).Set(float64(ss3[2]))
 		}
 	}
 }
