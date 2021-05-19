@@ -1,5 +1,3 @@
-// AF_Packet support for gotm
-
 package main
 
 import (
@@ -26,7 +24,6 @@ import (
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcap"
 	"github.com/google/gopacket/afpacket"
-	"golang.org/x/net/bpf"
 	"github.com/google/gopacket/pcapgo"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -50,14 +47,13 @@ var (
 	flowPacketCutoff   uint
 	writeOutputPath    string
 	writeCompressed    bool
+	fanoutGroup    int
 
 	rotationInterval time.Duration
 
 	dumnoEndpoint          string
 	largeFlowSizeMegabytes uint
 	dumbnoEnabled          bool
-	
-	fanoutGroup    int
 )
 
 //Metrics
@@ -164,12 +160,10 @@ func init() {
 	flag.StringVar(&writeOutputPath, "write", "out", "Output path is $writeOutputPath/yyyy/mm/dd/ts.pcap")
 	flag.BoolVar(&writeCompressed, "compress", false, "gzip pcaps as they are written")
 	flag.DurationVar(&rotationInterval, "rotationinterval", 300*time.Second, "Interval between pcap rotations")
-
+	flag.IntVar(&fanoutGroup, "fanoutGroup", 42, "fanout group id")
 	flag.UintVar(&largeFlowSizeMegabytes, "largeflowsize", 1024, "Large flow size in megabytes")
 	flag.StringVar(&dumnoEndpoint, "dumbno", "", "Endpoint that dumbno is listening on, i.e. 127.0.0.1:9000")
-	
-	flag.IntVar(&fanoutGroup, "fanoutGroup", 42, "fanout group id")
-	
+
 	prometheus.MustRegister(mActiveFlows)
 	prometheus.MustRegister(mExpired)
 	prometheus.MustRegister(mExpiredDurTotal)
@@ -230,68 +224,6 @@ func mustAtoiWithDefault(s string, defaultValue int) int {
 	return i
 }
 
-type afpacketHandle struct {
-	TPacket *afpacket.TPacket
-}
-
-// SetBPFFilter translates a BPF filter string into BPF RawInstruction and applies them.
-func (h *afpacketHandle) SetBPFFilter(filter string, snaplen int) (err error) {
-	pcapBPF, err := pcap.CompileBPFFilter(layers.LinkTypeEthernet, snaplen, filter)
-	if err != nil {
-		return err
-	}
-	bpfIns := []bpf.RawInstruction{}
-	for _, ins := range pcapBPF {
-		bpfIns2 := bpf.RawInstruction{
-			Op: ins.Code,
-			Jt: ins.Jt,
-			Jf: ins.Jf,
-			K:  ins.K,
-		}
-		bpfIns = append(bpfIns, bpfIns2)
-	}
-	if h.TPacket.SetBPF(bpfIns); err != nil {
-		return err
-	}
-	return h.TPacket.SetBPF(bpfIns)
-}
-
-func newAfpacketHandle(device string, snaplen int, block_size int, num_blocks int, timeout time.Duration) (*afpacketHandle, error) {
-
-	h := &afpacketHandle{}
-	var err error
-
-	if device == "any" {
-		h.TPacket, err = afpacket.NewTPacket(
-			afpacket.OptFrameSize(snaplen),
-			afpacket.OptBlockSize(block_size),
-			afpacket.OptNumBlocks(num_blocks),
-			afpacket.OptPollTimeout(timeout),
-			afpacket.SocketRaw,
-			afpacket.TPacketVersion3)
-	} else {
-		h.TPacket, err = afpacket.NewTPacket(
-			afpacket.OptInterface(device),
-			afpacket.OptFrameSize(snaplen),
-			afpacket.OptBlockSize(block_size),
-			afpacket.OptNumBlocks(num_blocks),
-			afpacket.OptPollTimeout(timeout),
-			afpacket.SocketRaw,
-			afpacket.TPacketVersion3)
-	}
-	return h, err
-}
-
-// ZeroCopyReadPacketData satisfies ZeroCopyPacketDataSource interface
-func (h *afpacketHandle) ZeroCopyReadPacketData() (data []byte, ci gopacket.CaptureInfo, err error) {
-	return h.TPacket.ZeroCopyReadPacketData()
-}
-
-// SocketStats prints received, dropped, queue-freeze packet stats.
-func (h *afpacketHandle) SocketStats() (as afpacket.SocketStats, asv afpacket.SocketStatsV3, err error) {
-	return h.TPacket.SocketStats()
-}
-
 // afpacketComputeSize computes the block_size and the num_blocks in such a way that the
 // allocated mmap buffer is close to but smaller than target_size_mb.
 // The restriction is that the block_size must be divisible by both the
@@ -316,51 +248,37 @@ func afpacketComputeSize(targetSizeMb int, snaplen int, pageSize int) (
 	return frameSize, blockSize, numBlocks, nil
 }
 
-func (h *afpacketHandle) SetFanout(t afpacket.FanoutType, id uint16) error {
-	return h.TPacket.SetFanout(t, id)
-}
-
-// Close will close afpacket source.
-func (h *afpacketHandle) Close() {
-	h.TPacket.Close()
-}
-
 func doSniff(intf string, worker int, writerchan chan PcapFrame, flowfilterchan chan FilterRequest) {
 	runtime.LockOSThread()
 	log.Printf("Starting worker %d on interface %s", worker, intf)
 	workerString := fmt.Sprintf("%d", worker)
 
 	var err error
-
-	//handle, err := pcap.OpenLive(intf, MAX_ETHERNET_MTU, true, pcap.BlockForever)
-	//handle, err := afpacket.NewTPacket(
-	//			afpacket.OptInterface(intf), 
-	//			afpacket.OptFrameSize(MAX_ETHERNET_MTU), 
-	//			afpacket.OptPollTimeout(pcap.BlockForever))
-
 	szFrame, szBlock, numBlocks, err := afpacketComputeSize(OUTPUT_BUFFER_SIZE, MAX_ETHERNET_MTU, os.Getpagesize())
+	log.Printf("Frame_size=%d Block_Size=%d Num_Blocks=%d", szFrame, szBlock, numBlocks)
+	//handle, err := pcap.OpenLive(intf, MAX_ETHERNET_MTU, true, pcap.BlockForever)
+	handle, err := afpacket.NewTPacket(afpacket.OptInterface(intf),
+					afpacket.OptFrameSize(szFrame),
+					afpacket.OptPollTimeout(pcap.BlockForever),
+					afpacket.OptBlockSize(szBlock),
+					afpacket.OptNumBlocks(numBlocks))
 	if err != nil {
 		panic(err)
 	}
-	afpacketHandle, err := newAfpacketHandle(intf, szFrame, szBlock, numBlocks, pcap.BlockForever)
+
+	err = handle.SetFanout(afpacket.FanoutHashWithDefrag, uint16(fanoutGroup))
 	if err != nil {
 		panic(err)
 	}
+
 	//err = handle.SetBPFFilter(filter)
-	err = afpacketHandle.SetBPFFilter(filter, MAX_ETHERNET_MTU)
 	if err != nil { // optional
 		panic(err)
 	}
-	
-	err = afpacketHandle.SetFanout(afpacket.FanoutHashWithDefrag, uint16(fanoutGroup))
-	if err != nil {
-		panic(err)
-	}
-	defer afpacketHandle.Close()
-	
+
 	seen := make(map[FiveTuple]*trackedFlow)
 	var totalFlows, totalBytes, outputBytes, totalPackets, outputPackets uint
-
+	//var pcapStats *pcap.Stats
 	lastcleanup := time.Now()
 
 	var eth layers.Ethernet
@@ -375,7 +293,7 @@ func doSniff(intf string, worker int, writerchan chan PcapFrame, flowfilterchan 
 	var speedup int
 	defaultLogThreshold := 1024 * 1024 * largeFlowSizeMegabytes
 	for {
-		packetData, ci, err := afpacketHandle.ZeroCopyReadPacketData()
+		packetData, ci, err := handle.ZeroCopyReadPacketData()
 		if err == io.EOF {
 			break
 		} else if err != nil {
@@ -436,8 +354,6 @@ func doSniff(intf string, worker int, writerchan chan PcapFrame, flowfilterchan 
 		if speedup == 5000 {
 			speedup = 0
 			//pcapStats, err = handle.Stats()
-			ss, ss3, err := afpacketHandle.SocketStats()
-			
 			if err != nil {
 				log.Fatal(err)
 			}
@@ -452,10 +368,14 @@ func doSniff(intf string, worker int, writerchan chan PcapFrame, flowfilterchan 
 						delete(seen, flow)
 					}
 				}
-				log.Printf("if=%s W=%02d flows=%d removed=%d bytes=%d pkts=%d output=%d outpct=%.1f stats{rec, dropped}: %d Statsv3{rec, dropped, queue-freeze}: %d",
+				//log.Printf("if=%s W=%02d flows=%d removed=%d bytes=%d pkts=%d output=%d outpct=%.1f recvd=%d dropped=%d ifdropped=%d",
+				//	intf, worker, len(seen), removedFlows,
+				//	totalBytes, totalPackets, outputPackets, 100*float64(outputPackets)/float64(totalPackets),
+				//	pcapStats.PacketsReceived, pcapStats.PacketsDropped, pcapStats.PacketsIfDropped)
+
+				log.Printf("if=%s W=%02d flows=%d removed=%d bytes=%d pkts=%d output=%d outpct=%.1f" ,
 					intf, worker, len(seen), removedFlows,
-					totalBytes, totalPackets, outputPackets, 100*float64(outputPackets)/float64(totalPackets),
-					ss, ss3)
+					totalBytes, totalPackets, outputPackets, 100*float64(outputPackets)/float64(totalPackets))
 
 				expireSeconds := float64(time.Since(lastcleanup).Seconds())
 				mExpired.WithLabelValues(intf, workerString).Set(float64(removedFlows))
@@ -478,9 +398,9 @@ func doSniff(intf string, worker int, writerchan chan PcapFrame, flowfilterchan 
 			mOutput.WithLabelValues(intf, workerString).Add(float64(outputPackets))
 			outputPackets = 0
 
-			//mReceived.WithLabelValues(intf, workerString).Set(float64(tp_packets))
-			//mDropped.WithLabelValues(intf, workerString).Set(float64(tp_drops))
-			//mIfDropped.WithLabelValues(intf, workerString).Set(float64(ss3[2]))
+			//mReceived.WithLabelValues(intf, workerString).Set(float64(pcapStats.PacketsReceived))
+			//mDropped.WithLabelValues(intf, workerString).Set(float64(pcapStats.PacketsDropped))
+			//mIfDropped.WithLabelValues(intf, workerString).Set(float64(pcapStats.PacketsIfDropped))
 		}
 	}
 }
